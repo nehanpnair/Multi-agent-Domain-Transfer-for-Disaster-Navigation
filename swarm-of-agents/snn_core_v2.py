@@ -40,6 +40,10 @@ class SNNDecision:
         self.w_two_hop    = 30.0
         self.w_momentum   = 4.0
         self.w_pheromone  = 8.0    # FIX F2: was 0.0 (feature existed but had no weight)
+        # Knowledge-driven terms (fed by what the agent has sensed or been told)
+        self.w_lookahead  = -6.0   # mean risk of the candidate's onward exits (known blocked=1)
+        self.w_dead_end   = -25.0  # every onward exit of the candidate is known blocked
+        self.w_plan       = 12.0   # candidate is the next hop of the agent's own plan
 
         self.momentum_decay   = 0.7
         self.last_direction   = None
@@ -47,6 +51,14 @@ class SNNDecision:
 
     def reset_momentum(self):
         self.last_direction = None
+
+    def apply_weights(self, overrides: dict):
+        """Override scorer parameters by name (used by role profiles).
+        Unknown names raise, so a typo in a role spec cannot silently do nothing."""
+        for k, v in (overrides or {}).items():
+            if not hasattr(self, k):
+                raise AttributeError(f"SNNDecision has no parameter {k!r}")
+            setattr(self, k, v)
 
     def compute_momentum_score(self, current_pos, next_pos):
         if self.last_direction is None:
@@ -128,9 +140,17 @@ class SNNDecision:
         # 11. Pheromone trail bonus — FIX F2: was never scored
         pheromone_score = feat.get('pheromone', 0.0) * self.w_pheromone
 
+        # 12. Knowledge terms. Dead-end avoidance is dropped in the final approach
+        #     where the goal itself is the exit.
+        look_score = feat.get('lookahead', 0.0) * self.w_lookahead
+        if not in_final:
+            look_score += feat.get('dead_end', 0.0) * self.w_dead_end
+        plan_score = feat.get('on_plan', 0.0) * self.w_plan
+
         return (goal_score + progress_score + hazard_score + visited_score +
                 backtrack_score + explore_score + mom_score +
-                taboo_score + bl_score + two_hop_score + pheromone_score)
+                taboo_score + bl_score + two_hop_score + pheromone_score +
+                look_score + plan_score)
 
     def softmax_selection(self, scores, temperature):
         max_s = max(scores)

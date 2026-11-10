@@ -1,3 +1,4 @@
+import heapq
 import math
 import random
 from collections import deque
@@ -32,8 +33,26 @@ class SNNAgent:
     # "blocked" threshold used by shared memory and the disaster engine).
     BLOCK_DAMAGE_THRESHOLD = 0.6
 
-    def __init__(self, graph, start_node, goal_node, enforce_passability=True, rng=None):
+    PLAN_MAX_EXPANSIONS = 40000   # A* budget per (re)plan
+    CELL_DEG = 0.002              # ~200 m coverage grid
+
+    def __init__(self, graph, start_node, goal_node, enforce_passability=True, rng=None,
+                 role="navigator"):
         self.graph        = graph
+        self.role         = role
+        self.clock        = 0            # current sim step, set by the simulation
+        self.stationary   = False        # hubs sense and communicate but do not move
+        self.sense_hops   = 1            # 2 = scouts see two hops out
+        self.use_lookahead = True        # score candidates by what is known beyond them
+        self.use_planner  = False        # follow a route planned on KNOWN hazards
+        self.plan         = None
+        self.plan_events  = []           # [{step, reason, ok}] for replans
+        self.stats = {"msgs_received": 0, "blocked_learned_self": 0,
+                      "blocked_learned_msg": 0, "replans": 0,
+                      "plan_invalidations": 0, "goal_changes": 0}
+        self.learned_at   = {}           # blocked node -> (step, "self" | "msg" | "board")
+        self.cell_counts  = {}           # coverage grid cell -> visits
+
         # Per-agent random stream: an agent's stochastic choices no longer depend
         # on how many other agents exist or in what order they act.
         self.rng          = rng if rng is not None else random
@@ -53,7 +72,7 @@ class SNNAgent:
         self.visited      = set([start_node])
         self.visit_counts = {start_node: 1}
         self.shared_memory = None
-        self.local_memory  = {"danger_nodes": {}}
+        self.local_memory  = {"danger_nodes": {}, "blocked_nodes": set()}
 
         # Tier 1: short-term taboo
         self.taboo_set   = set()
@@ -164,11 +183,156 @@ class SNNAgent:
             if (not self.graph.is_edge_passable(self.current_node, nid)
                     or dmg > self.BLOCK_DAMAGE_THRESHOLD):
                 blocked.add(nid)
+            if self.sense_hops >= 2:
+                # Longer-range sensing (scouts): node damage two hops out.
+                for m, _ in self.graph._adj.get(nid, ()):
+                    d2 = self.graph.get_node_damage(m)
+                    if d2 > 0.3:
+                        danger[m] = max(d2, danger.get(m, 0.0))
+                    if d2 > self.BLOCK_DAMAGE_THRESHOLD:
+                        blocked.add(m)
         for nid, dmg in danger.items():
             self.local_memory["danger_nodes"][nid] = max(
                 dmg, self.local_memory["danger_nodes"].get(nid, 0.0))
+        for nid in blocked:
+            self._learn_blocked(nid, "self")
         self.last_observation = {"blocked_nodes": blocked, "danger": danger}
         return self.last_observation
+
+    # ------------------------------------------------------------------ #
+    # Knowledge: what the agent has sensed itself, been told, or read from
+    # the shared board. Never the ground-truth damage map.
+    # ------------------------------------------------------------------ #
+
+    def _learn_blocked(self, nid, source):
+        lm = self.local_memory["blocked_nodes"]
+        if nid in lm:
+            return False
+        lm.add(nid)
+        self.learned_at[nid] = (self.clock, source)
+        self.stats["blocked_learned_self" if source == "self" else "blocked_learned_msg"] += 1
+        return True
+
+    def receive(self, msg):
+        """Merge a delivered Message into local knowledge. Returns #new blocked nodes."""
+        self.stats["msgs_received"] += 1
+        new = 0
+        for nid in msg.payload.get("blocked", ()):
+            new += self._learn_blocked(nid, "msg")
+        for nid, dmg in msg.payload.get("danger", {}).items():
+            cur = self.local_memory["danger_nodes"].get(nid, 0.0)
+            if dmg > cur:
+                self.local_memory["danger_nodes"][nid] = dmg
+        return new
+
+    def knows_blocked(self, nid):
+        if nid in self.local_memory["blocked_nodes"]:
+            return True
+        return bool(self.shared_memory) and nid in self.shared_memory["blocked_nodes"]
+
+    def known_danger(self, nid):
+        d = self.local_memory["danger_nodes"].get(nid, 0.0)
+        if self.shared_memory:
+            d = max(d, self.shared_memory["danger_nodes"].get(nid, 0.0))
+        return d
+
+    def _exit_risk(self, nid):
+        """(mean risk over onward exits, all-exits-blocked) for candidate `nid`,
+        from KNOWN hazards only. Risk of an exit = 1 if known blocked, else its
+        known danger level."""
+        exits = [m for m, _ in self.graph._adj.get(nid, ()) if m != self.current_node]
+        if not exits:
+            return 0.0, False
+        risks = [1.0 if self.knows_blocked(m) else self.known_danger(m) for m in exits]
+        return sum(risks) / len(risks), all(self.knows_blocked(m) for m in exits)
+
+    # ------------------------------------------------------------------ #
+    # Planning on known hazards (event-based replanning)
+    # ------------------------------------------------------------------ #
+
+    def _astar_known(self):
+        g, goal = self.graph, self.goal_node
+        if self.knows_blocked(goal):
+            return None
+        gd = g._nodes[goal]
+        def h(n):
+            nd = g._nodes[n]
+            return haversine_distance(nd['lat'], nd['lon'], gd['lat'], gd['lon'])
+        start = self.current_node
+        best = {start: 0.0}
+        parent = {}
+        heap = [(h(start), 0.0, start)]
+        expanded = 0
+        while heap:
+            _, d, u = heapq.heappop(heap)
+            if u == goal:
+                path = [u]
+                while u in parent:
+                    u = parent[u]
+                    path.append(u)
+                return path[::-1]
+            if d > best.get(u, float('inf')):
+                continue
+            expanded += 1
+            if expanded > self.PLAN_MAX_EXPANSIONS:
+                return None
+            for v, edge in g._adj.get(u, ()):
+                if v != goal and self.knows_blocked(v):
+                    continue
+                # known damage makes a node costlier but not forbidden
+                nd_ = d + edge["length"] * (1.0 + 2.0 * self.known_danger(v))
+                if nd_ < best.get(v, float('inf')):
+                    best[v] = nd_
+                    parent[v] = u
+                    heapq.heappush(heap, (nd_ + h(v), nd_, v))
+        return None
+
+    def _ensure_plan(self):
+        """Keep a route to the goal that avoids KNOWN blocked nodes. Replans only
+        when there is no plan, the agent has left it, or a node ahead has become
+        known-blocked (the event the old stall counter was trying to proxy)."""
+        reason = None
+        if self.plan is None:
+            reason = "no_plan"
+        else:
+            try:
+                pos = self.plan.index(self.current_node)
+            except ValueError:
+                pos = -1
+            if pos < 0:
+                reason = "off_plan"
+            elif any(self.knows_blocked(n) for n in self.plan[pos + 1:]):
+                reason = "invalidated"
+                self.stats["plan_invalidations"] += 1
+        if reason is None:
+            return
+        self.plan = self._astar_known()
+        self.stats["replans"] += 1
+        self.plan_events.append({"step": self.clock, "reason": reason,
+                                 "ok": self.plan is not None, "node": self.current_node})
+
+    def _plan_next(self):
+        if not self.plan:
+            return None
+        try:
+            i = self.plan.index(self.current_node)
+        except ValueError:
+            return None
+        return self.plan[i + 1] if i + 1 < len(self.plan) else None
+
+    def set_goal(self, node):
+        """Give the agent a new goal (waypoint or reassignment) and clear every
+        piece of goal-relative state so old progress/taboo logic cannot misfire."""
+        self.goal_node = node
+        self.reached_goal = False
+        self._last_dist_to_goal = None
+        self._steps_without_progress = 0
+        self._moving_away_counter = 0
+        self.oscillation_counter = 0
+        self._taboo_reset()
+        self.snn.reset_momentum()
+        self.plan = None
+        self.stats["goal_changes"] += 1
 
     # ------------------------------------------------------------------ #
     # Features
@@ -186,6 +350,10 @@ class SNNAgent:
         ph = {}
         if self.shared_memory:
             ph = self.shared_memory.get("pheromones", {})
+        plan_next = None
+        if self.use_planner:
+            self._ensure_plan()
+            plan_next = self._plan_next()
 
         for nid in neighbors:
             node_data = self.graph._nodes[nid]
@@ -218,7 +386,15 @@ class SNNAgent:
 
             pheromone = ph.get(nid, 0.0)
 
+            lookahead, dead_end = 0.0, 0.0
+            if self.use_lookahead and nid != self.goal_node:
+                lookahead, all_blocked = self._exit_risk(nid)
+                dead_end = 1.0 if all_blocked else 0.0
+
             features.append({
+                "lookahead":    lookahead,
+                "dead_end":     dead_end,
+                "on_plan":      1.0 if (plan_next is not None and nid == plan_next) else 0.0,
                 "node":         nid,
                 "dist":         dist,
                 "hazard":       hazard,
@@ -244,6 +420,12 @@ class SNNAgent:
             return
 
         self.sense()
+        if self.stationary:
+            hz = self.graph.get_node_damage(self.current_node)
+            if hz > 0.9:
+                self.alive = False
+                self.death_reason = "hazard"
+            return
         neighbors = self.get_neighbors()
         if not neighbors:
             self.alive = False
@@ -362,6 +544,9 @@ class SNNAgent:
         self.prev_node = prev
         self.visited.add(next_node)
         self.visit_counts[next_node] = self.visit_counts.get(next_node, 0) + 1
+        nd = self.graph._nodes[next_node]
+        cell = (int(nd['lat'] / self.CELL_DEG), int(nd['lon'] / self.CELL_DEG))
+        self.cell_counts[cell] = self.cell_counts.get(cell, 0) + 1
         self._taboo_add(prev)
 
         nxt_dist = haversine_distance(
@@ -387,4 +572,5 @@ class SNNAgent:
             return
         if next_node == self.goal_node:
             self.reached_goal = True
-            print(f"✓ Agent reached goal! Path length: {len(self.path)}")
+            if self.role == "navigator":
+                print(f"✓ Agent reached goal! Path length: {len(self.path)}")
