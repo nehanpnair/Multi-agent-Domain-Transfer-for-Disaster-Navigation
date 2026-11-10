@@ -431,6 +431,32 @@ class HybridTokyoGraph:
         self._disabled_edges.clear()
         self._node_damage.clear()
 
+    # -----------------------------------------------------------------------
+    # Run isolation: all per-scenario state is _node_damage + _disabled_edges.
+    # fork() gives each run its own copy of those two and shares everything
+    # else (nodes, adjacency, R-tree, KD-tree), so no reload or re-index.
+    # -----------------------------------------------------------------------
+
+    def fork(self) -> "HybridTokyoGraph":
+        """
+        Independent scenario view of this graph (microseconds, vs ~17 s to
+        reload and re-index). Damage applied to a fork never touches the parent
+        or other forks. Call after build_index(); do not mutate the static
+        network (nodes/edges/indexes) through a fork.
+        """
+        import copy
+        if not self._index_built:
+            raise RuntimeError("fork() requires build_index() to have been called")
+        g = copy.copy(self)                      # shallow: shares static structures
+        g._node_damage    = dict(self._node_damage)
+        g._disabled_edges = set(self._disabled_edges)
+        return g
+
+    def damage_fingerprint(self) -> tuple:
+        """Cheap summary of damage state, for leakage tests and logging."""
+        return (len(self._node_damage), len(self._disabled_edges),
+                round(sum(self._node_damage.values()), 6))
+
     def is_edge_passable(self, u: int, v: int) -> bool:
         return frozenset({u, v}) not in self._disabled_edges
 
@@ -671,3 +697,26 @@ class HybridTokyoGraph:
                 f"nodes={len(self._nodes):,} "
                 f"edges={sum(len(v) for v in self._adj.values())//2:,} "
                 f"[{idx_status}]>")
+
+
+# ---------------------------------------------------------------------------
+# Cached loader — parse + index each graph file once per process
+# ---------------------------------------------------------------------------
+
+_GRAPH_CACHE: dict = {}
+
+def load_cached(json_path: str) -> "HybridTokyoGraph":
+    """
+    Return a fresh, undamaged fork of a graph that is loaded and indexed only
+    once per process. Use one call per simulation run:
+
+        graph = load_cached("tokyo_graph.json")     # first call ~17 s, then instant
+    """
+    import os
+    key = os.path.abspath(json_path)
+    if key not in _GRAPH_CACHE:
+        base = HybridTokyoGraph(key)
+        base.build_index()
+        base.reset_disaster()
+        _GRAPH_CACHE[key] = base                 # pristine; never handed out directly
+    return _GRAPH_CACHE[key].fork()

@@ -25,7 +25,10 @@ class SNNDecision:
         exploration_rate raised 0.05→0.12.
     """
 
-    def __init__(self):
+    def __init__(self, rng=None):
+        # Own random stream (a random.Random). Falls back to the global module
+        # so existing scripts behave exactly as before.
+        self.rng = rng if rng is not None else random
         self.w_goal       = 10.0
         self.w_hazard     = -8.0
         self.w_visited    = -1.5   # applied as log-penalty now, see score_neighbor
@@ -134,7 +137,7 @@ class SNNDecision:
         exp_s = [math.exp((s - max_s) / temperature) for s in scores]
         tot   = sum(exp_s)
         probs = [e / tot for e in exp_s]
-        r     = random.random()
+        r     = self.rng.random()
         cumsum = 0.0
         for i, p in enumerate(probs):
             cumsum += p
@@ -175,9 +178,9 @@ class SNNDecision:
             return neighbor_features[self.softmax_selection(scores, temperature=0.5)]['node']
 
         # Exploration zone: higher temperature + explicit exploration rate
-        if random.random() < self.exploration_rate:
+        if self.rng.random() < self.exploration_rate:
             unvisited = [f for f in neighbor_features if f.get('is_new', 0.0) > 0.5]
             pool = unvisited if unvisited else neighbor_features
-            return random.choice(pool)['node']
+            return self.rng.choice(pool)['node']
 
         return neighbor_features[self.softmax_selection(scores, temperature=1.8)]['node']

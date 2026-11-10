@@ -32,8 +32,11 @@ class SNNAgent:
     # "blocked" threshold used by shared memory and the disaster engine).
     BLOCK_DAMAGE_THRESHOLD = 0.6
 
-    def __init__(self, graph, start_node, goal_node, enforce_passability=True):
+    def __init__(self, graph, start_node, goal_node, enforce_passability=True, rng=None):
         self.graph        = graph
+        # Per-agent random stream: an agent's stochastic choices no longer depend
+        # on how many other agents exist or in what order they act.
+        self.rng          = rng if rng is not None else random
         self.enforce_passability = enforce_passability
         self.death_reason = None          # "hazard" | "trapped" | None
         # What this agent physically sensed (1-hop) on its latest step.
@@ -41,7 +44,7 @@ class SNNAgent:
         self.current_node = start_node
         self.goal_node    = goal_node
 
-        self.snn = SNNDecision()
+        self.snn = SNNDecision(rng=self.rng)
 
         self.path         = [start_node]
         self.alive        = True
@@ -269,7 +272,7 @@ class SNNAgent:
                 escape = neighbors
 
             unvisited_escape = [n for n in escape if n not in self.visited]
-            next_node = random.choice(unvisited_escape if unvisited_escape else escape)
+            next_node = self.rng.choice(unvisited_escape if unvisited_escape else escape)
             self.oscillation_counter = 0
             self._execute_move(next_node, current_pos, goal_pos)
             return
@@ -309,7 +312,7 @@ class SNNAgent:
                           if n not in self.blacklist and n != self.prev_node]
                 if not escape:
                     escape = [n for n in neighbors if n != self.prev_node] or neighbors
-                next_node = random.choice(escape)
+                next_node = self.rng.choice(escape)
                 self.oscillation_counter = 0
         else:
             self.oscillation_counter = 0
@@ -338,7 +341,7 @@ class SNNAgent:
                 else:
                     pool = [f for f in non_bl if f['node'] != self.prev_node]
                     if pool:
-                        next_node = random.choice(pool)['node']
+                        next_node = self.rng.choice(pool)['node']
 
         self._execute_move(next_node, current_pos, goal_pos)
 

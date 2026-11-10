@@ -56,6 +56,9 @@ import random
 import math
 from agent_snn_v3 import SNNAgent, haversine_distance
 from dynamic_disaster_engine import DynamicDisasterEngine
+from feasibility import (agent_rng, spawn_rng, passable_components,
+                         candidate_nodes, sample_feasible_task, validate_task,
+                         SpawnError)
 
 
 class DynamicSwarmSimulation:
@@ -76,15 +79,26 @@ class DynamicSwarmSimulation:
         disaster_severity:     float = 0.7,
         wind_bearing_deg:      float = 45.0,
         seed:                  int   = None,
+        # Task control
+        tasks:                 list  = None,   # [(start, goal) | {"start","goal"}, ...]
+        require_feasible:      bool  = True,
+        max_optimal_hops:      int   = None,
+        spawn_attempts:        int   = 2000,
     ):
         self.graph      = graph
         self.num_agents = num_agents
         self.min_start_goal_distance = min_start_goal_distance
         self.max_start_goal_distance = max_start_goal_distance
 
-        self._rng = random.Random(seed)
-        if seed is not None:
-            random.seed(seed)
+        # No global seeding: every agent owns a private stream derived from
+        # (seed, agent_index), and the engine owns its own, so results do not
+        # depend on swarm size, agent order, or anything else using `random`.
+        self.seed             = seed
+        self.require_feasible = require_feasible
+        self.max_optimal_hops = max_optimal_hops
+        self.spawn_attempts   = spawn_attempts
+        self._given_tasks     = tasks
+        self.tasks: list      = []     # task info per agent (start, goal, optimal_m, ...)
 
         # ---- Disaster engine ----
         self.engine = DynamicDisasterEngine(
@@ -128,47 +142,57 @@ class DynamicSwarmSimulation:
         self._spawn_agents()
 
     # -----------------------------------------------------------------------
-    # Spawn (identical logic to SwarmSimulation v3, uses self._rng)
+    # Spawn (feasible tasks, per-agent seeded)
     # -----------------------------------------------------------------------
 
     def _spawn_agents(self):
-        nodes = list(self.graph._nodes.keys())
+        """
+        Create agents with feasible tasks.
+
+        Feasible = start and goal intact after the t=0 damage, connected by a
+        passable route (same rules the agent obeys), and optionally within
+        `max_optimal_hops`. Pass `tasks=` to reuse identical tasks across
+        experiment arms; otherwise task i is drawn from spawn_rng(seed, i).
+        """
+        comp = passable_components(self.graph)
+        cands = candidate_nodes(self.graph, comp)
+        given = self._given_tasks
+        if given is not None and len(given) < self.num_agents:
+            raise ValueError(f"tasks has {len(given)} entries, need {self.num_agents}")
 
         for i in range(self.num_agents):
-            placed, attempts = False, 0
-            while attempts < 200:
-                attempts += 1
-                start = self._rng.choice(nodes)
-                goal  = self._rng.choice(nodes)
-                if start == goal:
-                    continue
-                sd   = self.graph._nodes[start]
-                gd   = self.graph._nodes[goal]
-                dist = haversine_distance(sd['lat'], sd['lon'], gd['lat'], gd['lon'])
-                if (self.min_start_goal_distance <= dist <= self.max_start_goal_distance
-                        and self.graph._adj.get(start)
-                        and self.graph._adj.get(goal)):
-                    placed = True
-                    break
+            if given is not None:
+                t = given[i]
+                s_node, g_node = (t["start"], t["goal"]) if isinstance(t, dict) else t
+                info = validate_task(self.graph, s_node, g_node, comp,
+                                     self.max_optimal_hops)
+                if info is None:
+                    if self.require_feasible:
+                        raise ValueError(
+                            f"Task {i} ({s_node} -> {g_node}) is infeasible in this "
+                            f"scenario at t=0. Pass require_feasible=False to allow it.")
+                    info = {"start": s_node, "goal": g_node, "feasible": False}
+            else:
+                info = sample_feasible_task(
+                    self.graph, spawn_rng(self.seed, i), comp, cands,
+                    self.min_start_goal_distance, self.max_start_goal_distance,
+                    self.max_optimal_hops, self.spawn_attempts)
+            info.setdefault("feasible", True)
 
-            if not placed:
-                candidates = [n for n in nodes if self.graph._adj.get(n)]
-                if len(candidates) >= 2:
-                    start, goal = self._rng.sample(candidates, 2)
-                else:
-                    start, goal = self._rng.sample(nodes, 2)
-
-            agent = SNNAgent(self.graph, start, goal)
+            agent = SNNAgent(self.graph, info["start"], info["goal"],
+                             rng=agent_rng(self.seed, i))
             agent.shared_memory = self.shared_memory
+            agent.task_info = info
             self.agents.append(agent)
+            self.tasks.append(info)
 
             self._agent_reroute_events[i] = 0
             self._agent_adaptation_lag[i] = 0
 
-            sd   = self.graph._nodes[start]
-            gd   = self.graph._nodes[goal]
-            dist = haversine_distance(sd['lat'], sd['lon'], gd['lat'], gd['lon'])
-            print(f"Agent {i:2d} | Start: {start} → Goal: {goal} | {dist:.0f}m")
+            opt = info.get("optimal_m")
+            opt_s = f"{opt:.0f}m route" if opt is not None else "route n/a"
+            print(f"Agent {i:2d} | Start: {info['start']} → Goal: {info['goal']} | "
+                  f"{info.get('straight_m', float('nan')):.0f}m straight, {opt_s}")
 
     # -----------------------------------------------------------------------
     # Main run loop
