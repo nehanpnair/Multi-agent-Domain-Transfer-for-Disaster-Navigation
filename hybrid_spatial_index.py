@@ -379,7 +379,10 @@ class HybridTokyoGraph:
         for node in affected_nodes:
             dist = _haversine_m(lat, lon, node["lat"], node["lon"])
             attenuation = 1 - (dist / radius_m) * 0.5
-            self._node_damage[node["id"]] = min(severity * attenuation, 1.0)
+            self._node_damage[node["id"]] = max(
+                self._node_damage.get(node["id"], 0.0),
+                min(severity * attenuation, 1.0),
+            )
 
         # --- Edge disabling: R-tree query (Step 4) ---
         disabled_count = 0

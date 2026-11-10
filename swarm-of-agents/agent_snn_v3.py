@@ -28,8 +28,16 @@ class SNNAgent:
                    fired.
     """
 
-    def __init__(self, graph, start_node, goal_node):
+    # Node damage above this is treated as impassable (matches the 0.6
+    # "blocked" threshold used by shared memory and the disaster engine).
+    BLOCK_DAMAGE_THRESHOLD = 0.6
+
+    def __init__(self, graph, start_node, goal_node, enforce_passability=True):
         self.graph        = graph
+        self.enforce_passability = enforce_passability
+        self.death_reason = None          # "hazard" | "trapped" | None
+        # What this agent physically sensed (1-hop) on its latest step.
+        self.last_observation = {"blocked_nodes": set(), "danger": {}}
         self.current_node = start_node
         self.goal_node    = goal_node
 
@@ -124,8 +132,40 @@ class SNNAgent:
     # Graph
     # ------------------------------------------------------------------ #
 
-    def get_neighbors(self):
+    def get_all_neighbors(self):
+        """Every adjacent node, ignoring closures (used for sensing/metrics)."""
         return [nid for nid, _ in self.graph._adj.get(self.current_node, [])]
+
+    def is_passable(self, nid):
+        """A move is legal only if the edge is open and the target is not
+        destroyed. Both are locally observable from the current node."""
+        if not self.graph.is_edge_passable(self.current_node, nid):
+            return False
+        return self.graph.get_node_damage(nid) <= self.BLOCK_DAMAGE_THRESHOLD
+
+    def get_neighbors(self):
+        """Neighbours the agent can actually move to."""
+        nbrs = self.get_all_neighbors()
+        if not self.enforce_passability:
+            return nbrs
+        return [n for n in nbrs if self.is_passable(n)]
+
+    def sense(self):
+        """1-hop local sensing. Records closed neighbours and damaged
+        neighbours; the simulation decides what gets published to the swarm."""
+        blocked, danger = set(), {}
+        for nid in self.get_all_neighbors():
+            dmg = self.graph.get_node_damage(nid)
+            if dmg > 0.3:
+                danger[nid] = dmg
+            if (not self.graph.is_edge_passable(self.current_node, nid)
+                    or dmg > self.BLOCK_DAMAGE_THRESHOLD):
+                blocked.add(nid)
+        for nid, dmg in danger.items():
+            self.local_memory["danger_nodes"][nid] = max(
+                dmg, self.local_memory["danger_nodes"].get(nid, 0.0))
+        self.last_observation = {"blocked_nodes": blocked, "danger": danger}
+        return self.last_observation
 
     # ------------------------------------------------------------------ #
     # Features
@@ -200,9 +240,11 @@ class SNNAgent:
         if not self.alive or self.reached_goal:
             return
 
+        self.sense()
         neighbors = self.get_neighbors()
         if not neighbors:
             self.alive = False
+            self.death_reason = "trapped"
             return
 
         current_pos  = self.graph._nodes[self.current_node]
@@ -338,6 +380,7 @@ class SNNAgent:
             self.local_memory["danger_nodes"][next_node] = hazard
         if hazard > 0.9:
             self.alive = False
+            self.death_reason = "hazard"
             return
         if next_node == self.goal_node:
             self.reached_goal = True
